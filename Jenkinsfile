@@ -1,33 +1,111 @@
-try{
-	node{
-	    properties([parameters([choice(choices: ['master', 'dev', 'qa', 'staging'], description: 'Choose branch to build and deploy', name: 'gitBranch')]), pipelineTriggers([pollSCM('')])])
-    stage('Git Checkout'){
-		git credentialsId: 'github', 
-		    url: 'https://github.com/javahometech/my-app',
-			branch: "${params.gitBranch}"
-	}
-	
-	stage('Maven Build'){
-		sh 'mvn clean package'
-	}
-	stage('Deploy to Dev'){
-		sh 'mv target/*.war target/myweb.war'
-		sshagent(['tomcat-dev']) {
-			sh 'ssh ec2-user@172.31.17.196 rm -rf /opt/tomcat8/webapps/myweb*'
-		    sh 'scp target/myweb.war ec2-user@172.31.17.196:/opt/tomcat8/webapps/'
-		    sh 'ssh ec2-user@172.31.17.196 sudo service tomcat restart'
-		}
-	    slackSend channel: '#devops-2',
-				  color: 'good',
-				  message: "Job -  ${env.JOB_NAME}, Completed successfully Build URL is ${env.BUILD_URL}"
+pipeline {
 
+    agent any
 
-	}
-}
+    stages {
 
-}catch(error){
-  slackSend channel: '#devops-2',
-				  color: 'danger',
-				  message: "Job -  ${env.JOB_NAME}, Failed, Build URL is ${env.BUILD_URL}"
-   error 'Something wrong'
+        stage('Git Checkout') {
+            steps {
+                git 'https://github.com/Kalpeshpatilblaze/myweb-project.git'
+            }
+        }
+
+        stage('Maven Build') {
+            steps {
+                sh 'mvn clean package'
+            }
+        }
+
+        stage('Docker Image Build') {
+            steps {
+                sh 'docker build . -t myimage:$BUILD_NUMBER'
+            }
+        }
+
+        stage('Docker Image Tag and Push') {
+            steps {
+
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'dockerhub_id',
+                        usernameVariable: 'DOCKER_USERNAME',
+                        passwordVariable: 'DOCKER_PASSWORD'
+                    )
+                ]) {
+
+                    sh '''
+                        echo "$DOCKER_PASSWORD" | docker login \
+                            -u "$DOCKER_USERNAME" \
+                            --password-stdin
+
+                        docker tag \
+                            myimage:$BUILD_NUMBER \
+                            $DOCKER_USERNAME/myimage:$BUILD_NUMBER
+
+                        docker push \
+                            $DOCKER_USERNAME/myimage:$BUILD_NUMBER
+
+                        docker logout
+                    '''
+                }
+            }
+        }
+
+        stage('Update Kubernetes Image') {
+            steps {
+
+                sh '''
+                    sed -i "s|image:.*|image: kalpuaggressive/myimage:$BUILD_NUMBER|" deployments.yml
+
+                    echo "===== Kubernetes Image ====="
+                    grep "image:" deployments.yml
+                '''
+            }
+        }
+
+        stage('Kubernetes Deployment') {
+            steps {
+
+                sh '''
+                    kubectl apply -f deployments.yml
+                '''
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+
+                sh '''
+                    echo "===== Deployment ====="
+                    kubectl get deployment mywebdeployment
+
+                    echo "===== Rollout Status ====="
+                    kubectl rollout status \
+                        deployment/mywebdeployment \
+                        --timeout=5m
+
+                    echo "===== Pods ====="
+                    kubectl get pods -l app=myweb
+
+                    echo "===== Service ====="
+                    kubectl get service mywebservice
+                '''
+            }
+        }
+    }
+
+    post {
+
+        success {
+            echo 'CI/CD Pipeline completed successfully!'
+        }
+
+        failure {
+            echo 'CI/CD Pipeline failed!'
+        }
+
+        always {
+            cleanWs()
+        }
+    }
 }
